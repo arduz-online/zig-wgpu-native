@@ -1,0 +1,12 @@
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+
+  zig-overlay:
+    url: github:mitchellh/zig-overlay
+
+  zls:
+    url: github:zigtools/zls/0.15.0
+    inputs:
+      zig-overlay:
+        follows: zig-overlay

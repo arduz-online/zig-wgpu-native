@@ -62,7 +62,7 @@ pub fn addLibraryPath(b: *std.Build, compile: *std.Build.Step.Compile, linkage: 
 
     const opt = if (compile.root_module.optimize == .Debug) "debug" else "release";
 
-    const wgpu_path = try ensureWgpuBinaryDownloaded(std.heap.page_allocator, WGPU_NATIVE_RELEASE, target, opt);
+    const wgpu_path = try getWgpu(b, target, opt);
 
     std.debug.print("WGPU_NATIVE ROOT: {s}\n", .{wgpu_path});
     if (os == .macos) {
@@ -139,225 +139,58 @@ fn sdkPath(comptime suffix: []const u8) []const u8 {
     };
 }
 
-fn getGitHubBaseURLOwned(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "GITHUB_BASE_URL")) |base_url| {
-        std.log.info("zig-wgpu: respecting GITHUB_BASE_URL: {s}\n", .{base_url});
-        return base_url;
-    } else |_| {
-        return allocator.dupe(u8, "https://github.com");
-    }
+// File system utilities
+pub fn dirExists(io: Io, path: []const u8) bool {
+    var dir = Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
 }
 
-var download_mutex = std.Thread.Mutex{};
-
-fn getWgpuInstallDir(
-    allocator: std.mem.Allocator,
-    version: []const u8,
-    target: std.Build.ResolvedTarget,
-    opt: []const u8,
-) ![]const u8 {
-    const base_cache_dir_rel = try std.fs.path.join(allocator, &.{ ".zig-cache", "wgpu-native", opt });
-    try std.fs.cwd().makePath(base_cache_dir_rel);
-    const base_cache_dir = try std.fs.cwd().realpathAlloc(allocator, base_cache_dir_rel);
-    const versioned_cache_dir = try std.fs.path.join(allocator, &.{ base_cache_dir, version });
-
-    defer {
-        allocator.free(base_cache_dir_rel);
-        allocator.free(base_cache_dir);
-        allocator.free(versioned_cache_dir);
-    }
-
-    const target_cache_dir = try std.fs.path.join(allocator, &.{ versioned_cache_dir, @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) });
-    return target_cache_dir;
+pub fn fileExists(io: Io, path: []const u8) bool {
+    var file = Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
 }
 
-/// ensures the library exists and returns an absolute path to the extracted folder
-fn ensureWgpuBinaryDownloaded(
-    allocator: std.mem.Allocator,
-    version: []const u8,
-    target: std.Build.ResolvedTarget,
-    opt: []const u8,
-) ![]const u8 {
-    const target_cache_dir = try getWgpuInstallDir(allocator, version, target, opt);
-
-    const commit_sha_file = try std.fs.path.join(allocator, &.{ target_cache_dir, "wgpu-native-git-tag" });
-
-    if (fileExists(commit_sha_file)) {
-        return target_cache_dir; // nothing to do, already have the binary
-    }
-
-    downloadWgpu(allocator, target_cache_dir, version, target, opt) catch |err| {
-        // A download failed, or extraction failed, so wipe out the directory to ensure we correctly
-        // try again next time.
-        // std.fs.deleteTreeAbsolute(base_cache_dir) catch {};
-        std.log.err("zig-wgpu: download wgpu-native failed: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-
-    if (!fileExists(commit_sha_file)) {
-        std.log.err("zig-wgpu: file not found: {s}", .{commit_sha_file});
-        std.process.exit(1);
-    }
-
-    return target_cache_dir;
-}
-
-/// Compose the download URL, e.g.:
-/// https://github.com/gfx-rs/wgpu-native/releases/download/v0.19.3.1/wgpu-linux-aarch64-debug.zip
-fn getWgpuDownloadLink(allocator: std.mem.Allocator, version: []const u8, target: std.Build.ResolvedTarget, opt: []const u8) !?[]const u8 {
-    const github_base_url = try getGitHubBaseURLOwned(allocator);
-    defer allocator.free(github_base_url);
-
-    const os: ?[]const u8 = switch (target.result.os.tag) {
-        .macos => "macos",
+pub fn getWgpu(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) !?*std.Build.Dependency {
+    const os: []const u8 = switch (target) {
+        // .macos => "osx",
         .linux => "linux",
         .windows => "windows",
-        else => null,
+        else => @compileError("Unsupported target platform"),
     };
-
-    const arch: ?[]const u8 = switch (target.result.cpu.arch) {
-        .aarch64, .aarch64_be, .aarch64_32 => "aarch64",
+    
+    // wgpu_linux_x86_64_debug wgpu_windows_x86_64_debug
+    const arch: []const u8 = switch (builtin.cpu.arch) {
         .x86_64 => "x86_64",
-        else => @panic("Unsupported architecture"),
+        else => @compileError("Unsupported target architecture"),
     };
+    
+    const opt = if (.optimize == .Debug) "debug" else "release";
 
-    const asset = try std.mem.concat(allocator, u8, &.{ "wgpu-", os.?, "-", arch.?, "-", opt, ".zip" });
-    defer allocator.free(asset);
+    const dependencyName = try std.mem.concat(b.allocator, u8, &.{ "wgpu_", os, "_", arch, "_", opt });
+    defer b.allocator.free(dependencyName);
 
-    return try std.mem.concat(allocator, u8, &.{
-        github_base_url,
-        "/gfx-rs/wgpu-native/releases/download/v",
-        version,
-        "/",
-        asset,
-    });
-}
-
-fn downloadWgpu(
-    allocator: std.mem.Allocator,
-    target_cache_dir: []const u8,
-    version: []const u8,
-    target: std.Build.ResolvedTarget,
-    opt: []const u8,
-) !void {
-    download_mutex.lock();
-    defer download_mutex.unlock();
-
-    ensureCanDownloadFiles(allocator);
-    ensureCanUnzipFiles(allocator);
-
-    const download_dir = try std.fs.path.join(allocator, &.{ target_cache_dir, "download" });
-    defer allocator.free(download_dir);
-    std.fs.cwd().makePath(download_dir) catch @panic(download_dir);
-    std.debug.print("download_dir: {s}\n", .{download_dir});
-
-    // Replace "..." with "---" because GitHub releases has very weird restrictions on file names.
-    // https://twitter.com/slimsag/status/1498025997987315713
-
-    const download_url = try getWgpuDownloadLink(allocator, version, target, opt);
-
-    if (download_url == null) {
-        std.log.err("zig-wgpu: cannot resolve a wgpu-natibe version to download. make sure the architecture you are using is supported", .{});
-        std.process.exit(1);
+    if (b.lazyDependency(dependencyName, .{})) |dep| {
+        return dep;
     }
 
-    defer allocator.free(download_url.?);
-
-    // Download wgpu-native
-    const zip_target_file = try std.fs.path.join(allocator, &.{ download_dir, "wgpu.zip" });
-    defer allocator.free(zip_target_file);
-    downloadFile(allocator, zip_target_file, download_url.?) catch @panic(zip_target_file);
-
-    // Decompress the .zip file
-    unzipFile(allocator, zip_target_file, target_cache_dir) catch @panic(zip_target_file);
-
-    try std.fs.deleteTreeAbsolute(download_dir);
+    return null;
 }
 
-fn dirExists(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-    dir.close();
-    return true;
-}
+pub fn getProtocBin(step: *std.Build.Step) !?[]const u8 {
+    if (try getWgpu(step.owner)) |dep| {
+        if (builtin.os.tag == .windows)
+            return dep.path("bin/protoc.exe").getPath2(step.owner, step);
 
-fn fileExists(path: []const u8) bool {
-    var file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    file.close();
-    return true;
-}
-
-fn isEnvVarTruthy(allocator: std.mem.Allocator, name: []const u8) bool {
-    if (std.process.getEnvVarOwned(allocator, name)) |truthy| {
-        defer allocator.free(truthy);
-        if (std.mem.eql(u8, truthy, "true")) return true;
-        return false;
-    } else |_| {
-        return false;
+        return dep.path("bin/protoc").getPath2(step.owner, step);
     }
+    return null;
 }
 
-fn downloadFile(allocator: std.mem.Allocator, target_file: []const u8, url: []const u8) !void {
-    std.debug.print("downloading {s}..\n", .{url});
-
-    // Some Windows users experience `SSL certificate problem: unable to get local issuer certificate`
-    // so we give them the option to disable SSL if they desire / don't want to debug the issue.
-    var child = if (isEnvVarTruthy(allocator, "CURL_INSECURE"))
-        std.process.Child.init(&.{ "curl", "--insecure", "-L", "-o", target_file, url }, allocator)
-    else
-        std.process.Child.init(&.{ "curl", "-L", "-o", target_file, url }, allocator);
-    child.cwd = sdkPath("/");
-    child.stderr = std.io.getStdErr();
-    child.stdout = std.io.getStdOut();
-    _ = try child.spawnAndWait();
-}
-
-fn unzipFile(allocator: std.mem.Allocator, file: []const u8, target_directory: []const u8) !void {
-    std.debug.print("decompressing {s}..\n", .{file});
-
-    var child = std.process.Child.init(
-        &.{ "unzip", "-o", file, "-d", target_directory },
-        allocator,
-    );
-    child.cwd = sdkPath("/");
-    child.stderr = std.io.getStdErr();
-    child.stdout = std.io.getStdOut();
-    _ = try child.spawnAndWait();
-}
-
-fn ensureCanDownloadFiles(allocator: std.mem.Allocator) void {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "--version" },
-        .cwd = sdkPath("/"),
-    }) catch { // e.g. FileNotFound
-        std.log.err("zig-wgpu: error: 'curl --version' failed. Is curl not installed?", .{});
-        std.process.exit(1);
-    };
-    defer {
-        allocator.free(result.stderr);
-        allocator.free(result.stdout);
-    }
-    if (result.term.Exited != 0) {
-        std.log.err("zig-wgpu: error: 'curl --version' failed. Is curl not installed?", .{});
-        std.process.exit(1);
-    }
-}
-
-fn ensureCanUnzipFiles(allocator: std.mem.Allocator) void {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{"unzip"},
-        .cwd = sdkPath("/"),
-    }) catch { // e.g. FileNotFound
-        std.log.err("zig-wgpu: error: 'unzip' failed. Is curl not installed?", .{});
-        std.process.exit(1);
-    };
-    defer {
-        allocator.free(result.stderr);
-        allocator.free(result.stdout);
-    }
-    if (result.term.Exited != 0) {
-        std.log.err("zig-wgpu: error: 'unzip' failed. Is curl not installed?", .{});
-        std.process.exit(1);
-    }
+fn dupeLazyPaths(b: *std.Build, paths: []const std.Build.LazyPath) []std.Build.LazyPath {
+    const array = b.allocator.alloc(std.Build.LazyPath, paths.len) catch @panic("OOM");
+    for (array, paths) |*dest, source|
+        dest.* = source.dupe(b);
+    return array;
 }
