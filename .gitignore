@@ -176,3 +176,4 @@ dist
 
 .devenv
 zig-pkg
+.zig-cache

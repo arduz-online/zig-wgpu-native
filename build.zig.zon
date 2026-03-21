@@ -1,7 +1,8 @@
 .{
     .name = .wgpu,
-    .version = "0.18.1-4",
-    .fingerprint = 0x956466d962447749,
+    .version = "27.0.4",
+    .fingerprint = 0x956466d923983111,
+    .minimum_zig_version = "0.15.2",
     .paths = .{
         "src",
         "build.zig",
@@ -11,7 +12,7 @@
     .dependencies = .{
         .xcode_frameworks = .{
             .url = "https://pkg.machengine.org/xcode-frameworks/122b43323db27b2082a2d44ed2121de21c9ccf75.tar.gz",
-            .hash = "12205d131983601cdb3500f38e9d8adaed5574fb0211b8b39291d2e9b90c6555ce59",
+            .hash = "",
             .lazy = true,
         },
         .wgpu_linux_x86_64_release = .{
