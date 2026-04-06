@@ -3,14 +3,16 @@ const extras = {
 
     // Start at 0003 since that's allocated range for wgpu-native
     device_extras = 0x00030001,
-    required_limits_extras = 0x00030002,
+    native_limits = 0x00030002,
     pipeline_layout_extras = 0x00030003,
-    shader_module_glsl_descriptor = 0x00030004,
-    supported_limits_extras = 0x00030005,
+    shader_source_glsl = 0x00030004,
     instance_extras = 0x00030006,
     bind_group_entry_extras = 0x00030007,
     bind_group_layout_entry_extras = 0x00030008,
     query_set_descriptor_extras = 0x00030009,
+    surface_configuration_extras = 0x0003000A,
+    surface_source_swap_chain_panel = 0x0003000B,
+    primitive_state_extras = 0x0003000C,
 `,
   FileHeader: `
 
@@ -18,7 +20,7 @@ const std = @import("std");
 const log = std.log.scoped(.wgpu);
 
 pub const EnumType = u32;
-pub const Flags = u32;
+pub const Flags = u64;
 
 pub const Bool = enum(u32) {
     false = 0,
@@ -36,6 +38,41 @@ pub inline fn toNative(self: Bool) bool {
 const uint32_max = std.math.maxInt(u32);
 const usize_max = std.math.maxInt(usize);
 const uint64_max = std.math.maxInt(u64);
+
+/// Sentinel value indicating a null-terminated string or the null string view.
+pub const WGPU_STRLEN = std.math.maxInt(usize);
+
+pub const StringView = extern struct {
+    data: ?[*]const u8 = null,
+    length: usize = WGPU_STRLEN,
+
+    /// The null StringView: {null, WGPU_STRLEN}.
+    pub const null_value: StringView = .{ .data = null, .length = WGPU_STRLEN };
+
+    /// The empty StringView: {null, 0}.
+    pub const empty: StringView = .{ .data = null, .length = 0 };
+
+    /// Create a StringView from a Zig slice.
+    pub fn fromSlice(slice: []const u8) StringView {
+        return .{ .data = slice.ptr, .length = slice.len };
+    }
+
+    /// Create a StringView from a null-terminated string.
+    pub fn fromSliceZ(slice: [:0]const u8) StringView {
+        return .{ .data = slice.ptr, .length = WGPU_STRLEN };
+    }
+
+    /// Convert a StringView to a Zig slice.
+    pub fn toSlice(self: StringView) []const u8 {
+        if (self.data) |ptr| {
+            if (self.length == WGPU_STRLEN) {
+                return std.mem.span(@as([*:0]const u8, @ptrCast(ptr)));
+            }
+            return ptr[0..self.length];
+        }
+        return &[_]u8{};
+    }
+};
 
 pub const ChainedStruct = extern struct {
     next: ?*const ChainedStruct = null,
@@ -99,7 +136,7 @@ pub const InstanceBackendFlags = packed struct(Flags) {
     dx11: bool = false,
     browser_web_gpu: bool = false,
 
-    _padding: u26 = 0,
+    _padding: u58 = 0,
 
     pub const primary = InstanceBackendFlags{
         .vulkan = true,
@@ -119,14 +156,32 @@ pub const InstanceFlags = packed struct(Flags) {
     validation: bool = false,
     discard_hal_labels: bool = false,
 
-    _padding: u29 = 0,
+    _padding: u61 = 0,
 };
 
 pub const SubmissionIndex = u64;
 
-pub const WrappedSubmissionIndex = extern struct {
-    queue: *Queue,
-    submission_index: SubmissionIndex,
+
+pub const GlFenceBehaviour = enum(EnumType) {
+    normal = 0x00000000,
+    auto_finish = 0x00000001,
+};
+
+pub const DxcMaxShaderModel = enum(EnumType) {
+    v6_0 = 0x00000000,
+    v6_1 = 0x00000001,
+    v6_2 = 0x00000002,
+    v6_3 = 0x00000003,
+    v6_4 = 0x00000004,
+    v6_5 = 0x00000005,
+    v6_6 = 0x00000006,
+    v6_7 = 0x00000007,
+};
+
+pub const Dx12SwapchainKind = enum(EnumType) {
+    undef = 0x00000000,
+    dxgi_from_hwnd = 0x00000001,
+    dxgi_from_visual = 0x00000002,
 };
 
 pub const InstanceExtras = extern struct {
@@ -135,18 +190,22 @@ pub const InstanceExtras = extern struct {
     flags: InstanceFlags = .{},
     dx12_shader_compiler: Dx12Compiler = .undef,
     gles3_minor_version: Gles3MinorVersion = .automatic,
-    dxil_path: ?[*:0]const u8 = null,
-    dxc_path: ?[*:0]const u8 = null,
+    gl_fence_behaviour: GlFenceBehaviour = .normal,
+    dxc_path: StringView = .empty,
+    dxc_max_shader_model: DxcMaxShaderModel = .v6_0,
+    dx12_presentation_system: Dx12SwapchainKind = .undef,
+    budget_for_device_creation: ?[*]const u8 = null,
+    budget_for_device_loss: ?[*]const u8 = null,
 };
 
 pub const BindGroupEntryExtras = extern struct {
     chain: ChainedStruct = .{ .s_type = .bind_group_entry_extras },
-    buffers: ?[*]const *Buffer,
-    buffer_count: usize,
-    samplers: ?[*]const *Sampler,
-    sampler_count: usize,
-    texture_views: ?[*]const *TextureView,
-    textureViewCount: usize,
+    buffers: ?[*]const *Buffer = null,
+    buffer_count: usize = 0,
+    samplers: ?[*]const *Sampler = null,
+    sampler_count: usize = 0,
+    texture_views: ?[*]const *TextureView = null,
+    texture_view_count: usize = 0,
 };
 
 pub const BindGroupLayoutEntryExtras = extern struct {
@@ -154,7 +213,7 @@ pub const BindGroupLayoutEntryExtras = extern struct {
     count: u32,
 };
 
-pub const LogCallback = *const fn (level: LogLevel, message: [*:0]const u8, userdata: ?*anyopaque) callconv(.C) void;
+pub const LogCallback = *const fn (level: LogLevel, message: StringView, userdata: ?*anyopaque) callconv(.c) void;
 
 pub fn setLogCallback(callback: LogCallback, userdata: ?*anyopaque) void {
     wgpuSetLogCallback(callback, userdata);
@@ -174,7 +233,7 @@ extern fn wgpuGetVersion() u32;
 `,
   BindGroupEntry: `
     /// Helper to create a buffer BindGroup.Entry.
-    pub fn buffer(binding: u32, buf: *Buffer, offset: u64, size: u64) BindGroupEntry {
+    pub fn createBuffer(binding: u32, buf: *Buffer, offset: u64, size: u64) BindGroupEntry {
         return .{
             .binding = binding,
             .buffer = buf,
@@ -184,7 +243,7 @@ extern fn wgpuGetVersion() u32;
     }
 
     /// Helper to create a sampler BindGroup.Entry.
-    pub fn sampler(binding: u32, _sampler: *Sampler) BindGroupEntry {
+    pub fn createSampler(binding: u32, _sampler: *Sampler) BindGroupEntry {
         return .{
             .binding = binding,
             .sampler = _sampler,
@@ -193,7 +252,7 @@ extern fn wgpuGetVersion() u32;
     }
 
     /// Helper to create a texture view BindGroup.Entry.
-    pub fn textureView(binding: u32, texture_view: *TextureView) BindGroupEntry {
+    pub fn createTextureView(binding: u32, texture_view: *TextureView) BindGroupEntry {
         return .{
             .binding = binding,
             .texture_view = texture_view,
@@ -218,7 +277,7 @@ extern fn wgpuGetVersion() u32;
   BindGroupLayoutEntry: `
 
     /// Helper to create a buffer BindGroupLayout.Entry.
-    pub fn buffer(
+    pub fn createBuffer(
         binding: u32,
         visibility: ShaderStageFlags,
         binding_type: BufferBindingType,
@@ -237,7 +296,7 @@ extern fn wgpuGetVersion() u32;
     }
 
     /// Helper to create a sampler BindGroupLayout.Entry.
-    pub fn sampler(
+    pub fn createSampler(
         binding: u32,
         visibility: ShaderStageFlags,
         binding_type: SamplerBindingType,
@@ -250,7 +309,7 @@ extern fn wgpuGetVersion() u32;
     }
 
     /// Helper to create a texture BindGroupLayout.Entry.
-    pub fn texture(
+    pub fn createTexture(
         binding: u32,
         visibility: ShaderStageFlags,
         sample_type: TextureSampleType,
@@ -269,7 +328,7 @@ extern fn wgpuGetVersion() u32;
     }
 
     /// Helper to create a storage texture BindGroupLayout.Entry.
-    pub fn storageTexture(
+    pub fn createStorageTexture(
         binding: u32,
         visibility: ShaderStageFlags,
         access: StorageTextureAccess,
@@ -332,8 +391,8 @@ extern fn wgpuGetVersion() u32;
 
     pub inline fn writeTexture(
         queue: *Queue,
-        destination: *const ImageCopyTexture,
-        data_layout: *const TextureDataLayout,
+        destination: *const TexelCopyTextureInfo,
+        data_layout: *const TexelCopyBufferLayout,
         write_size: *const Extent3D,
         data_slice: anytype,
     ) void {
@@ -350,15 +409,19 @@ extern fn wgpuGetVersion() u32;
     pub inline fn onSubmittedWorkDone(
         queue: *Queue,
         context: anytype,
-        comptime callback: fn (ctx: @TypeOf(context), status: QueueWorkDoneStatus) callconv(.Inline) void,
-    ) void {
+        comptime callback: fn (ctx: @TypeOf(context), status: QueueWorkDoneStatus) void,
+    ) Future {
         const Context = @TypeOf(context);
         const Helper = struct {
-            pub fn cCallback(status: QueueWorkDoneStatus, userdata: ?*anyopaque) callconv(.C) void {
-                callback(if (Context == void) {} else @as(Context, @ptrCast(@alignCast(userdata))), status);
+            pub fn cCallback(status: QueueWorkDoneStatus, userdata1: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+                callback(if (Context == void) {} else @as(Context, @ptrCast(@alignCast(userdata1))), status);
             }
         };
-        wgpuQueueOnSubmittedWorkDone(queue, Helper.cCallback, if (Context == void) null else context);
+        return wgpuQueueOnSubmittedWorkDone(queue, .{
+            .mode = .allow_spontaneous,
+            .callback = Helper.cCallback,
+            .userdata1 = if (Context == void) null else context,
+        });
     }
 
     // WGPU-Native stuff
@@ -378,16 +441,17 @@ extern fn wgpuGetVersion() u32;
 const RequestDeviceData = struct {
         device: *Device = undefined,
         status: RequestDeviceStatus = .unknown,
-        message: ?[*:0]const u8 = null,
+        message: StringView = .empty,
     };
 
     fn handleRequestDevice(
         status: RequestDeviceStatus,
         device: *Device,
-        message: ?[*:0]const u8,
-        userdata: ?*anyopaque,
-    ) callconv(.C) void {
-        const data: *RequestDeviceData = @ptrCast(@alignCast(userdata.?));
+        message: StringView,
+        userdata1: ?*anyopaque,
+        _: ?*anyopaque,
+    ) callconv(.c) void {
+        const data: *RequestDeviceData = @ptrCast(@alignCast(userdata1.?));
         data.* = .{
             .device = device,
             .status = status,
@@ -400,11 +464,10 @@ const RequestDeviceData = struct {
         descriptor: DeviceDescriptor,
     ) !*Device {
         var data = RequestDeviceData{};
-        wgpuAdapterRequestDevice(
+        _ = wgpuAdapterRequestDevice(
             self,
             &descriptor,
-            handleRequestDevice,
-            @ptrCast(&data),
+            .{ .mode = .allow_spontaneous, .callback = handleRequestDevice, .userdata1 = @ptrCast(&data) },
         );
 
         if (data.status == .success) {
@@ -412,7 +475,7 @@ const RequestDeviceData = struct {
         } else {
             log.err(
                 "Device request failed. status: {s} message: {s}",
-                .{ @tagName(data.status), data.message.? },
+                .{ @tagName(data.status), data.message.toSlice() },
             );
             return error.WGPUDeviceRequestFailed;
         }
@@ -424,43 +487,40 @@ const RequestDeviceData = struct {
     /// Helper to make createShaderModule invocations slightly nicer.
     pub inline fn createShaderModuleWGSL(
         device: *Device,
-        label: ?[*:0]const u8,
+        label: [*:0]const u8,
         wgsl_code: [*:0]const u8,
     ) *ShaderModule {
         return device.createShaderModule(ShaderModuleDescriptor{
-            // .next_in_chain = .{ .shader_source_WGSL = &.{ .code = wgsl_code } },
-            .next_in_chain = .{ .shader_module_WGSL_descriptor = &.{ .code = wgsl_code } },
-            .label = label,
+            .next_in_chain = .{ .shader_source_WGSL = &.{ .code = .{ .data = wgsl_code, .length = WGPU_STRLEN } } },
+            .label = .{ .data = label, .length = WGPU_STRLEN },
         });
     }
 
     //WGPU-Native stuff
-    pub fn poll(self: *Device, wait: bool, wrapped_submission_index: ?WrappedSubmissionIndex) bool {
+    pub fn poll(self: *Device, wait: bool, submission_index: ?SubmissionIndex) bool {
         const wait_bool = if (wait) Bool.true else Bool.false;
-        switch (wgpuDevicePoll(self, wait_bool, if (wrapped_submission_index) |w| &w else null)) {
-            .true => return true,
-            .false => return false,
-        }
+        return wgpuDevicePoll(self, wait_bool, if (submission_index) |s| &s else null) != .false;
     }
 
     //WGPU-Native stuff
-    extern fn wgpuDevicePoll(device: *Device, wait: Bool, wrapped_submission_index: ?*const WrappedSubmissionIndex) Bool;
+    extern fn wgpuDevicePoll(device: *Device, wait: Bool, submission_index: ?*const SubmissionIndex) Bool;
 `,
   Instance: `
 
 const RequestAdapterData = struct {
         adapter: *Adapter = undefined,
         status: RequestAdapterStatus = .unknown,
-        message: ?[*:0]const u8 = null,
+        message: StringView = .empty,
     };
 
     fn handleAdapterRequest(
         status: RequestAdapterStatus,
         adapter: *Adapter,
-        message: ?[*:0]const u8,
-        userdata: ?*anyopaque,
-    ) callconv(.C) void {
-        const data: *RequestAdapterData = @ptrCast(@alignCast(userdata.?));
+        message: StringView,
+        userdata1: ?*anyopaque,
+        _: ?*anyopaque,
+    ) callconv(.c) void {
+        const data: *RequestAdapterData = @ptrCast(@alignCast(userdata1.?));
         data.* = .{
             .adapter = adapter,
             .status = status,
@@ -470,11 +530,10 @@ const RequestAdapterData = struct {
 
     pub fn requestAdapter(instance: *Instance, options: RequestAdapterOptions) !*Adapter {
         var data = RequestAdapterData{};
-        wgpuInstanceRequestAdapter(
+        _ = wgpuInstanceRequestAdapter(
             instance,
             &options,
-            handleAdapterRequest,
-            @ptrCast(&data),
+            .{ .mode = .allow_spontaneous, .callback = handleAdapterRequest, .userdata1 = @ptrCast(&data) },
         );
 
         if (data.status == .success) {
@@ -482,7 +541,7 @@ const RequestAdapterData = struct {
         } else {
             log.err(
                 "Adapter request failed. status: {s}, message: {s}",
-                .{ @tagName(data.status), data.message.? },
+                .{ @tagName(data.status), data.message.toSlice() },
             );
             return error.WGPURequestAdapterFailed;
         }
@@ -522,6 +581,7 @@ export function defaultValue(
     "color::a": "1.0",
     "extent_3D::depth_or_array_layers": 1,
     "multisample_state::count": 1,
+    "render_pass_color_attachment::depth_slice": "uint32_max",
     "multisample_state::mask": "0xffffffff",
     "primitive_state::topology": ".triangle_list",
     "primitive_state::front_face": ".ccw",

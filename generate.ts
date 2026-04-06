@@ -53,12 +53,75 @@ if (process.argv.includes("json")) {
   process.exit(0);
 }
 
+
+const constTypes: Record<string, any> = {}
+
+// Populate constTypes for callback_info.* types so find() resolves them as structs
+function populateCallbackInfoTypes() {
+  for (const C of (doc as any).callbacks ?? []) {
+    constTypes[`callback_info.${C.name}`] = { ns: "structs", cleanName: C.name + "_callback_info" };
+  }
+}
+
+populateCallbackInfoTypes();
+
+
+// Functions that are declared in webgpu.h but not yet implemented in wgpu-native.
+// See: https://github.com/gfx-rs/wgpu-native/blob/trunk/src/unimplemented.rs
+const unimplemented = new Set([
+  "wgpuGetProcAddress",
+  "wgpuBindGroupSetLabel",
+  "wgpuBindGroupLayoutSetLabel",
+  "wgpuBufferGetMapState",
+  "wgpuBufferSetLabel",
+  "wgpuCommandBufferSetLabel",
+  "wgpuCommandEncoderSetLabel",
+  "wgpuComputePassEncoderSetLabel",
+  "wgpuComputePipelineSetLabel",
+  "wgpuDeviceCreateComputePipelineAsync",
+  "wgpuDeviceCreateRenderPipelineAsync",
+  "wgpuDeviceGetAdapterInfo",
+  "wgpuDeviceGetLostFuture",
+  "wgpuDeviceSetLabel",
+  "wgpuInstanceGetWgslLanguageFeatures",
+  "wgpuInstanceHasWgslLanguageFeature",
+  "wgpuInstanceWaitAny",
+  "wgpuPipelineLayoutSetLabel",
+  "wgpuQuerySetSetLabel",
+  "wgpuQueueSetLabel",
+  "wgpuRenderBundleSetLabel",
+  "wgpuRenderBundleEncoderSetLabel",
+  "wgpuRenderPassEncoderSetLabel",
+  "wgpuRenderPipelineSetLabel",
+  "wgpuSamplerSetLabel",
+  "wgpuShaderModuleGetCompilationInfo",
+  "wgpuShaderModuleSetLabel",
+  "wgpuSurfaceSetLabel",
+  "wgpuTextureSetLabel",
+  "wgpuTextureViewSetLabel",
+]);
+
+// Structs whose FreeMembers is unimplemented in wgpu-native
+const unimplementedFreeMembers = new Set([
+  "supported_WGSL_language_features",
+]);
+
+function isUnimplemented(objName: string | undefined, methodName: string): boolean {
+  return unimplemented.has(wgpuName(objName, methodName));
+}
+
 function find<T>(
   identifier: string,
 ): (T & { ns: string; cleanName: string }) | null {
+
+  if (identifier in constTypes) return constTypes[identifier]
+
   try {
     let [ns, name] = identifier.split(".");
     if (!ns.endsWith("s")) ns = ns + "s";
+
+    if (!(doc as any)[ns]) return null;
+
     return {
       ns,
       cleanName: name,
@@ -186,7 +249,7 @@ for (const C of doc.bitflags) {
       i++;
     }
   }
-  if (i < 32) console.log(`\n  _padding: u${32 - i} = 0,\n`);
+  if (i < 64) console.log(`\n  _padding: u${64 - i} = 0,\n`);
 
   for (const E of C.entries) {
     if (E.value_combination) {
@@ -226,7 +289,7 @@ function T(
   };
 } {
   let { type, optional, pointer, name } = m;
-  let zigType = "void";
+  let zigType = "IDK";
   let defVal = null;
 
   const isArray = type.startsWith(`array<`);
@@ -237,8 +300,19 @@ function T(
   }
 
   if (type == "string") {
-    zigType = "[*:0]const u8";
-    if (optional) defVal = "null";
+    zigType = "StringView";
+    defVal = ".empty";
+  } else if (type == "nullable_string") {
+    zigType = "StringView";
+    defVal = ".null_value";
+  } else if (type == "string_with_default_empty") {
+    zigType = "StringView";
+    defVal = ".empty";
+  } else if (type == "out_string") {
+    zigType = "StringView";
+    defVal = ".empty";
+  } else if (type == "void") {
+    zigType = "void";
   } else if (type == "uint16") {
     zigType = "u16";
     defVal = 0;
@@ -282,9 +356,7 @@ function T(
   } else if (type.startsWith("returns_async.")) {
     zigType = NAME(type.substring(14)) + "AsyncCallback";
   } else if (type.startsWith("callback.")) {
-    zigType = NAME(type.substring(9)) + "Callback";
-    optional = true;
-    defVal = "null";
+    zigType = NAME(type.substring(9)) + "CallbackInfo";
   } else if (type.startsWith("callback_info.")) {
     zigType = NAME(type.substring(14) + "_callback_info");
   } else if (type.startsWith("bitflag.")) {
@@ -299,6 +371,8 @@ function T(
     zigType = "*" + NAME(type.substring(7));
   }
 
+  if(zigType == "IDK") throw new Error(`Can't resolve type ${type}`)
+
   let argType = zigType;
 
   if (isArray) {
@@ -310,7 +384,10 @@ function T(
       defVal = null;
     }
   } else {
-    if (pointer == "immutable" || type.startsWith("function_type.")) {
+    if (type.startsWith("callback_info.") || type.startsWith("callback.")) {
+      // CallbackInfo structs are passed by value in the C ABI
+      argType = zigType;
+    } else if (pointer == "immutable" || type.startsWith("function_type.")) {
       argType = `*const ${zigType.replace(/^\*/, "")}`;
     } else if (pointer == "mutable" && !type.startsWith("object.")) {
       argType = `*${zigType}`;
@@ -358,7 +435,11 @@ function printStruct(S: WStruct, pub?: boolean) {
       }
       break;
     case "base_out":
-      baseType = "?*const ChainedStructOut";
+      baseType = "?*ChainedStructOut";
+      baseDefault = "null";
+      break;
+    case "base_in_or_out":
+      baseType = "?*ChainedStructOut";
       baseDefault = "null";
       break;
     case "extension_in":
@@ -451,13 +532,13 @@ function printStruct(S: WStruct, pub?: boolean) {
     );
   }
 
-  if (S.free_members) {
+  if (S.free_members && !unimplementedFreeMembers.has(S.name)) {
     console.log(`
     /// Releases the wgpu-owned memory of the members of this struct.
-    pub fn deinit(self: *${NAME(S.name)}) void {
+    pub fn deinit(self: ${NAME(S.name)}) void {
         wgpu${NAME(S.name)}FreeMembers(self);
     }
-    extern fn wgpu${NAME(S.name)}FreeMembers(self: *${NAME(S.name)}) void;
+    extern fn wgpu${NAME(S.name)}FreeMembers(self: ${NAME(S.name)}) void;
 `);
   }
   console.log(helpersFor(NAME(S.name)));
@@ -481,10 +562,13 @@ for (const C of doc.callbacks ?? []) {
     console.log(`  ${safeZig(E.name)}: ${zig.argType},`);
   }
   console.log(
-    "userdata1: ?*anyopaque, userdata2: ?*anyopaque) callconv (.C) void;",
+    "userdata1: ?*anyopaque, userdata2: ?*anyopaque) callconv (.c) void;",
   );
   console.log(`pub const ${NAME(C.name)}CallbackInfo = extern struct {`);
   console.log(`    next_in_chain: ?*const ChainedStruct = null,`);
+  if (C.style === "callback_mode") {
+    console.log(`    mode: CallbackMode = .wait_any_only,`);
+  }
   console.log(`    callback: ${NAME(C.name)}Callback,`);
   console.log(`    userdata1: ?*anyopaque = null,`);
   console.log(`    userdata2: ?*anyopaque = null,`);
@@ -501,7 +585,7 @@ for (const C of doc.returns_asyncs ?? []) {
     const { zig } = T(E, false, "");
     console.log(`  ${safeZig(E.name)}: ${zig.argType},`);
   }
-  console.log("userdata: ?*anyopaque) callconv (.C) void;");
+  console.log("userdata: ?*anyopaque) callconv (.c) void;");
 }
 
 console.log(`
@@ -514,7 +598,7 @@ for (const C of doc.function_types ?? []) {
     const { zig } = T(E, false, "");
     console.log(`  ${safeZig(E.name)}: ${zig.argType},`);
   }
-  console.log(") callconv (.C) void;");
+  console.log(") callconv (.c) void;");
 }
 
 console.log(`
@@ -600,7 +684,7 @@ function printMethod(method: WFunction, obj?: WObject) {
   }
 
   let retTypeResolved = retType.pointer ? find<WStruct>(retType.type) : null;
-  let requiresAllocator = retTypeResolved?.free_members;
+  let requiresAllocator = false; // retTypeResolved?.free_members;
 
   if (requiresAllocator) {
     argsTypes.push({
@@ -639,6 +723,10 @@ function printMethod(method: WFunction, obj?: WObject) {
       if (i != argsTypes.length - 1 || haveDocs) console.log(",");
 
       if (argStruct[i]?.ns == "structs" && A.pointer != "mutable") {
+        // callback_info types are passed by value in extern, so no & needed
+        if (A.type?.startsWith("callback_info.") || A.type?.startsWith("callback.")) {
+          return cs.snakeCase(A.name);
+        }
         return "&" + cs.snakeCase(A.name);
       } else if (A.zig.isArray) {
         return [cs.snakeCase(A.name) + ".len", cs.snakeCase(A.name) + ".ptr"];
@@ -717,6 +805,7 @@ for (const C of doc.objects) {
   const helpers = helpersFor(NAME(C.name));
 
   for (const E of C.methods) {
+    if (isUnimplemented(C.name, E.name)) continue;
     const header = `fn ${cs.camelCase(E.name)}(`;
     if (helpers?.includes(header)) continue;
     printMethod(E, C);
@@ -725,7 +814,7 @@ for (const C of doc.objects) {
   console.log(`
     /// Increases the wgpu reference counter
     pub fn addRef(self: *${NAME(C.name)}) void {
-        wgpu${NAME(C.name)}Reference(self);
+        wgpu${NAME(C.name)}AddRef(self);
     }
 
     /// Releases the wgpu-owned object.
@@ -736,6 +825,7 @@ for (const C of doc.objects) {
   helpers && console.log(helpers);
 
   for (const E of C.methods) {
+    if (isUnimplemented(C.name, E.name)) continue;
     let retType = T(E.returns ?? { type: "void" }, false, "");
     const argsTypes = params(E.args).flatMap((A) => {
       if (A.zig.isArray)
@@ -796,13 +886,14 @@ for (const C of doc.objects) {
     );
     console.log(`) ${retType.zig.argType};`);
   }
-  console.log(`extern fn wgpu${NAME(C.name)}Reference(self: *${NAME(C.name)}) void;
+  console.log(`extern fn wgpu${NAME(C.name)}AddRef(self: *${NAME(C.name)}) void;
     extern fn wgpu${NAME(C.name)}Release(self: *${NAME(C.name)}) void;
 `);
   console.log("};\n");
 }
 
 for (const E of doc.functions) {
+  if (isUnimplemented(undefined, E.name)) continue;
   printMethod(E);
 
   let retType = T(E.returns ?? { type: "void" }, false, '');
